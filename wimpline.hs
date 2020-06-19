@@ -4,7 +4,6 @@ import System.CPUTime
 import Data.List
 import Data.String
 import Text.Printf
-import Data.Text as T (splitOn, pack, unpack)
 
 data Config = Config {
     rightSide :: Bool,
@@ -48,7 +47,7 @@ data Segment = StrSegment String SegmentConfig
              | ExitCode Int SegmentConfig
              | Hostname SegmentConfig
              | Duration (Maybe Double) SegmentConfig
-             | Condition Segment (Maybe Segment) SegmentConfig
+             | Condition String Segment Segment
              | Empty SegmentConfig deriving (Show)
 
 --Process arguments that modify the previous segment's configuration
@@ -174,26 +173,35 @@ ellipseNodes _ nodes = nodes
 abbreviateNodes nodes = map abbreviate (init nodes) ++ [(last nodes)]
     where abbreviate str = if null str then str else [head str]
 
+split :: Char -> String -> [String]
+split sep str =  case dropWhile (==sep) str of
+                         "" -> []
+                         str' -> w : split sep str''
+                                 where (w, str'') = break (==sep) str'
+
 body :: Env -> Segment -> String
 body _ (StrSegment string _) = string
 body _ (ViMode mode SegmentConfig {short = short}) = if short then take 1 modeStr else modeStr
     where modeStr = viModeMsg mode
 body Env {hostname = Just hostname, ssh = ssh } (Hostname SegmentConfig {short = short, alwaysShown = shown}) =
     if shown || ssh
-    then if short then takeWhile (/= '.') hostname else hostname
+    then prefix ++ if short then takeWhile (/= '.') hostname else hostname
     else ""
+    where prefix = if ssh then "\57506 " else ""
 body Env {hostname = Nothing, ssh = ssh } (Hostname SegmentConfig {short = short, alwaysShown = shown}) =
     if shown || ssh
-    then if short then "%m" else "%M"
+    then prefix ++ if short then "%m" else "%M"
     else ""
+    where prefix = if ssh then "\57506 " else ""
 body _ (Duration (Just time) SegmentConfig {short = short, alwaysShown = shown}) =
     if time > 1.0 || shown
     then if short
          then show (floor time) ++ "s"
-         else printf "%.9f" time ++ "s"
+         else "\61463 " ++ printf "%.9f" time ++ "s"
     else ""
 body _ (Duration Nothing SegmentConfig {short = short, alwaysShown = shown}) =
     ""
+body _ (Condition condition _ _) = condition
 body Env {cwd = cwd, home = home} (Path maxNodes SegmentConfig {short = short}) =
     if short
     then intercalate "/" $ abbreviateNodes ellipsedNodes
@@ -202,7 +210,7 @@ body Env {cwd = cwd, home = home} (Path maxNodes SegmentConfig {short = short}) 
           path = if isPrefixOf home cwd
                  then "~" ++ drop homeLength cwd
                  else cwd
-          nodes = map T.unpack $ T.splitOn (T.pack "/") (T.pack path)
+          nodes = split '/' path
           ellipsedNodes = ellipseNodes maxNodes nodes
 body _ (ExitCode code SegmentConfig {alwaysShown = shown, short = short})
     | code == 0 && not shown = ""
@@ -219,7 +227,9 @@ format env segment = bolden config . colorForeground (foreground segment) $ (bod
     where config = getSegmentConfig segment
 
 draw :: Env -> Bool -> Bool -> String -> Int -> Segment -> String
---draw _ _ _ _ _ (Empty _) = ""
+draw env dir skipDivider divider padding (Condition condition first second) =
+    "%(" ++ condition ++ "." ++ (drawSegment first) ++ "." ++ (drawSegment second) ++ ")"
+    where drawSegment = draw env dir skipDivider divider padding
 draw env True skipDivider divider padding segment =
     "%F{" ++ bg ++ "}" ++ divider ++ "%f%K{" ++ bg ++ "}" ++ (pad padding $ format env segment)
     where bg = background segment
@@ -273,6 +283,8 @@ processSegments env (('-':flag:arg):args) =
                                else Just (read arg :: Int)) defaultSegmentConfig):segments
                  'o' -> let (first:second:rest) = segments
                         in if visible env first then first:rest else second:rest
+                 'c' -> let (first:second:rest) = segments
+                        in (Condition arg first second):rest
                  _   -> let (segment:rest) = segments
                             config = getSegmentConfig segment
                             updatedConfig = processSegmentConfig config flag arg
