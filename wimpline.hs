@@ -1,6 +1,5 @@
 import System.Environment
 import System.Directory
-import System.CPUTime
 import Data.List
 import Data.String
 import Text.Printf
@@ -9,20 +8,19 @@ data Config = Config {
     rightSide :: Bool,
     padding :: Int,
     divider :: Maybe String,
-    width :: Maybe Int
+    columns :: Maybe Int
 } deriving (Show)
 
 data Env = Env {
     cwd :: String,
     home :: String,
-    hostname :: Maybe String,
     ssh :: Bool
 }
 
 defaultConfig = Config { rightSide = False,
                          padding = 1,
                          divider = Nothing,
-                         width = Nothing }
+                         columns = Nothing }
                  
 
 data SegmentConfig = SegmentConfig { background1 :: String,
@@ -30,6 +28,7 @@ data SegmentConfig = SegmentConfig { background1 :: String,
                                      foreground1 :: Maybe String,
                                      foreground2 :: Maybe String,
                                      alwaysShown :: Bool,
+                                     width :: Maybe Int,
                                      bold :: Bool,
                                      short :: Bool } deriving (Show)
 
@@ -38,6 +37,7 @@ defaultSegmentConfig = SegmentConfig { background1 = "16",
                                        foreground1 = Nothing,
                                        foreground2 = Nothing,
                                        alwaysShown = False,
+                                       width = Nothing,
                                        bold = False,
                                        short = False }
 
@@ -45,7 +45,7 @@ data Segment = StrSegment String SegmentConfig
              | Path (Maybe Int) SegmentConfig
              | ViMode String SegmentConfig
              | ExitCode Int SegmentConfig
-             | Hostname SegmentConfig
+             | Hostname (Maybe String) SegmentConfig
              | Duration (Maybe Double) SegmentConfig
              | Condition String Segment Segment
              | Empty SegmentConfig deriving (Show)
@@ -59,6 +59,8 @@ processSegmentConfig config flag arg =
                  'K' -> config { background2 = arg }
                  'f' -> config { foreground1 = Just arg }
                  'F' -> config { foreground2 = Just arg }
+                 'w' -> config { width = Just (read arg :: Int) }
+                 --TODO -r centering the following and reversing remaining segments
 
 background :: Segment -> String
 background (StrSegment _ SegmentConfig {background1 = bg}) = bg
@@ -67,7 +69,7 @@ background (ViMode mode SegmentConfig {background1 = bg1, background2 = bg2}) =
     if insertMode mode then bg2 else bg1
 background (ExitCode code SegmentConfig {background1 = bg1, background2 = bg2}) =
     if code == 0 then bg1 else bg2
-background (Hostname SegmentConfig {background1 = bg}) = bg
+background (Hostname _ SegmentConfig {background1 = bg}) = bg
 background (Duration _ SegmentConfig {background1 = bg}) = bg
 background (Empty SegmentConfig {background1 = bg}) = bg
 
@@ -78,7 +80,7 @@ foreground (ViMode mode SegmentConfig {foreground1 = fg1, foreground2 = fg2}) =
     if insertMode mode then fg2 else fg1
 foreground (ExitCode code SegmentConfig {foreground1 = fg1, foreground2 = fg2}) =
     if code == 0 then fg2 else fg1
-foreground (Hostname SegmentConfig {foreground1 = fg}) = fg
+foreground (Hostname _ SegmentConfig {foreground1 = fg}) = fg
 foreground (Duration _ SegmentConfig {foreground1 = fg}) = fg
 foreground (Empty SegmentConfig {foreground1 = fg}) = fg
 
@@ -97,7 +99,6 @@ insertMode _ = True
 
 viModeMsg :: String -> String
 viModeMsg mode
-    | null mode       = "      "
     | insertMode mode = "INSERT"
     | otherwise       = "NORMAL"
 
@@ -183,12 +184,12 @@ body :: Env -> Segment -> String
 body _ (StrSegment string _) = string
 body _ (ViMode mode SegmentConfig {short = short}) = if short then take 1 modeStr else modeStr
     where modeStr = viModeMsg mode
-body Env {hostname = Just hostname, ssh = ssh } (Hostname SegmentConfig {short = short, alwaysShown = shown}) =
+body Env {ssh = ssh } (Hostname (Just hostname) SegmentConfig {short = short, alwaysShown = shown}) =
     if shown || ssh
     then prefix ++ if short then takeWhile (/= '.') hostname else hostname
     else ""
     where prefix = if ssh then "\57506 " else ""
-body Env {hostname = Nothing, ssh = ssh } (Hostname SegmentConfig {short = short, alwaysShown = shown}) =
+body Env {ssh = ssh } (Hostname _ SegmentConfig {short = short, alwaysShown = shown}) =
     if shown || ssh
     then prefix ++ if short then "%m" else "%M"
     else ""
@@ -218,24 +219,45 @@ body _ (ExitCode code SegmentConfig {alwaysShown = shown, short = short})
     | otherwise = exitMsg code
 body _ (Empty _) = ""
 
-pad :: Int -> String -> String
-pad num string = padding ++ string ++ padding
+pad :: Maybe Int -> Int -> (String, Int) -> (String, Int)
+pad (Just width) _ (string, bodyWidth) =
+    (((padding left) ++ string ++ (padding right)), width)
+    where num = width - bodyWidth
+          left = num `div` 2
+          right = num - left
+          padding x = take x $ repeat ' '
+pad Nothing num (string, bodyWidth)
+    | null string = (string, num * 2)
+    | otherwise = ((padding ++ string ++ padding), bodyWidth + (num * 2))
     where padding = take num $ repeat ' '
 
-format :: Env -> Segment -> String
-format env segment = bolden config . colorForeground (foreground segment) $ (body env segment)
+format :: Env -> Segment -> (String, Int)
+format env segment = ((bolden config $ colorForeground (foreground segment) body'),
+                      (length body'))
     where config = getSegmentConfig segment
+          body' = body env segment
 
-draw :: Env -> Bool -> Bool -> String -> Int -> Segment -> String
+draw :: Env -> Bool -> Bool -> String -> Int -> Segment -> (String, Int)
 draw env dir skipDivider divider padding (Condition condition first second) =
-    "%(" ++ condition ++ "." ++ (drawSegment first) ++ "." ++ (drawSegment second) ++ ")"
+    ("%(" ++ condition ++ "." ++ firstStr ++ "." ++ secondStr ++ ")", width)
     where drawSegment = draw env dir skipDivider divider padding
+          (firstStr, firstWidth) = if visible env first
+                                   then drawSegment first
+                                   else ("", 0)
+          (secondStr, secondWidth) = if visible env second
+                                     then drawSegment second
+                                     else ("", 0)
+          width = if firstWidth > secondWidth then firstWidth else secondWidth
 draw env True skipDivider divider padding segment =
-    "%F{" ++ bg ++ "}" ++ divider ++ "%f%K{" ++ bg ++ "}" ++ (pad padding $ format env segment)
+    ("%F{" ++ bg ++ "}" ++ divider ++ "%f%K{" ++ bg ++ "}" ++ body', (width' + 2))
     where bg = background segment
+          expectedWidth = width $ getSegmentConfig segment
+          (body', width') = pad expectedWidth padding $ format env segment
 draw env False skipDivider divider padding segment =
-    "%K{" ++ bg ++ "}" ++ div ++ "%f" ++ (pad padding $ format env segment) ++ "%F{" ++ bg ++ "}%k"
+    ("%K{" ++ bg ++ "}" ++ div ++ "%f" ++ body' ++ "%F{" ++ bg ++ "}%k", (width' + 2))
     where bg = background segment
+          expectedWidth = width $ getSegmentConfig segment
+          (body', width') = pad expectedWidth padding $ format env segment
           div = if skipDivider then "" else divider
 
 --Extract config from a segment
@@ -244,7 +266,7 @@ getSegmentConfig (StrSegment _ c) = c
 getSegmentConfig (Path _ c) = c
 getSegmentConfig (ViMode _ c) = c
 getSegmentConfig (ExitCode _ c) = c
-getSegmentConfig (Hostname c) = c
+getSegmentConfig (Hostname _ c) = c
 getSegmentConfig (Duration _ c) = c
 getSegmentConfig (Empty c) = c
 
@@ -254,7 +276,7 @@ setSegmentConfig (StrSegment x _) c = StrSegment x c
 setSegmentConfig (Path x _) c = Path x c
 setSegmentConfig (ViMode x _) c = ViMode x c
 setSegmentConfig (ExitCode x _) c = ExitCode x c
-setSegmentConfig (Hostname _) c = Hostname c
+setSegmentConfig (Hostname x _) c = Hostname x c
 setSegmentConfig (Duration x _) c = Duration x c
 setSegmentConfig (Empty _) c = Empty c
 
@@ -262,8 +284,12 @@ setSegmentConfig (Empty _) c = Empty c
 processSegments :: Env -> [String] -> [Segment]
 processSegments _ [] = []
 processSegments env (('-':flag:arg):args) =
-    case flag of 'h' -> (Hostname defaultSegmentConfig { short = True }):segments
-                 'H' -> (Hostname defaultSegmentConfig):segments
+    case flag of 'h' -> (Hostname (if null arg
+                                   then Nothing
+                                   else Just arg) defaultSegmentConfig { short = True }):segments
+                 'H' -> (Hostname (if null arg
+                                   then Nothing
+                                   else Just arg) defaultSegmentConfig):segments
                  'x' -> (ExitCode (read arg :: Int) defaultSegmentConfig { short = True }):segments
                  'X' -> (ExitCode (read arg :: Int) defaultSegmentConfig):segments
                  'v' -> (ViMode arg defaultSegmentConfig { short = True }):segments
@@ -301,7 +327,7 @@ processArgs env ("--":xs) = (defaultConfig, processSegments env xs)
 processArgs env (('-':flag:arg):xs) =
     case flag of 'r' -> (retConf { rightSide = True }, retSeg)
                  'p' -> (retConf { padding = read arg :: Int }, retSeg)
-                 'w' -> (retConf { width = Just (read arg :: Int) }, retSeg)
+                 'w' -> (retConf { columns = Just (read arg :: Int) }, retSeg)
                  'd' -> (retConf { divider = Just arg }, retSeg)
     where (retConf, retSeg) = processArgs env xs
 
@@ -313,34 +339,34 @@ visible env segment = not $ null $ body env segment
 
 prompt :: Env -> (Config, [Segment]) -> String
 prompt env (config, segments) =
-    fst (foldl concatSegments ("", width) shownSegments) ++ suffix
+    fst (foldl concatSegments ("", columns) shownSegments) ++ suffix
     where shownSegments = filter (visible env) segments
           Config {padding = padding, divider = divider,
-                  rightSide = reverse, width = width} = config
+                  rightSide = reverse, columns = columns} = config
           div = case divider of Just d  -> d
                                 otherwise -> if reverse then "\57522" else "\57520"
           suffix = if reverse then "%k" else div ++ "%f "
-          concatSegments (buf, Nothing) segment = (buf ++ (draw env reverse (null buf) div pad segment),
+          concatSegments (buf, Nothing) segment = (buf ++ body,
                                                    Nothing)
               where pad = case segment of Empty _ -> 0
                                           otherwise -> padding
+                    (body, width) = draw env reverse (null buf) div pad segment
           concatSegments (buf, Just colsLeft) segment = if adjustedCols >= 0
-                                                        then (buf ++ (draw env reverse (null buf) div pad segment),
+                                                        then (buf ++ body,
                                                               Just adjustedCols)
                                                         else (buf, Just colsLeft)
-              where adjustedCols = colsLeft - (1 + padding * 2 + (length $ body env segment))
+              where adjustedCols = colsLeft - width
                     pad = case segment of Empty _ -> 0
                                           otherwise -> padding
+                    (body, width) = draw env reverse (null buf) div pad segment
 
 main :: IO ()
 main = do
     args <- getArgs
     cwd  <- getCurrentDirectory
     home <- getHomeDirectory
-    hostname <- lookupEnv "HOST" --FIXME less spoofable source
-    sshClient <- lookupEnv "SSH_CLIENT"
+    sshClient <- lookupEnv "SSH_CONNECTION" --TODO display IPs
     let env = Env {cwd = cwd,
                    home = home,
-                   hostname = hostname,
                    ssh = (sshClient /= Nothing)}
         in putStr $ prompt env $ processArgs env args
