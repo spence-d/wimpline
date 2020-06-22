@@ -28,6 +28,7 @@ data SegmentConfig = SegmentConfig { background1 :: String,
                                      foreground1 :: Maybe String,
                                      foreground2 :: Maybe String,
                                      alwaysShown :: Bool,
+                                     pivot ::Bool,
                                      width :: Maybe Int,
                                      bold :: Bool,
                                      short :: Bool } deriving (Show)
@@ -37,6 +38,7 @@ defaultSegmentConfig = SegmentConfig { background1 = "16",
                                        foreground1 = Nothing,
                                        foreground2 = Nothing,
                                        alwaysShown = False,
+                                       pivot = False,
                                        width = Nothing,
                                        bold = False,
                                        short = False }
@@ -60,7 +62,7 @@ processSegmentConfig config flag arg =
                  'f' -> config { foreground1 = Just arg }
                  'F' -> config { foreground2 = Just arg }
                  'w' -> config { width = Just (read arg :: Int) }
-                 --TODO -r centering the following and reversing remaining segments
+                 'r' -> config { pivot = True }
 
 background :: Segment -> String
 background (StrSegment _ SegmentConfig {background1 = bg}) = bg
@@ -89,8 +91,8 @@ colorForeground f string =
     case f of Just color -> "%F{" ++ color ++ "}" ++ string ++ "%f"
               Nothing    -> string
 
-bolden :: SegmentConfig -> String -> String
-bolden SegmentConfig {bold = b} string =
+bolden :: Bool -> String -> String
+bolden b string =
     if b then "%B" ++ string ++ "%b" else string
 
 insertMode :: String -> Bool
@@ -219,9 +221,16 @@ body _ (ExitCode code SegmentConfig {alwaysShown = shown, short = short})
     | otherwise = exitMsg code
 body _ (Empty _) = ""
 
+chop :: Maybe Int -> (String, Int) -> (String, Int)
+chop (Just width) (string, bodyWidth)
+    | bodyWidth > width = (((take (width - 1) string) ++ "…"), width)
+    | otherwise = (string, bodyWidth)
+chop _ ret = ret
+
 pad :: Maybe Int -> Int -> (String, Int) -> (String, Int)
-pad (Just width) _ (string, bodyWidth) =
-    (((padding left) ++ string ++ (padding right)), width)
+pad (Just width) _ (string, bodyWidth)
+    | bodyWidth == width = (string, width)
+    | otherwise = (((padding left) ++ string ++ (padding right)), width)
     where num = width - bodyWidth
           left = num `div` 2
           right = num - left
@@ -231,11 +240,9 @@ pad Nothing num (string, bodyWidth)
     | otherwise = ((padding ++ string ++ padding), bodyWidth + (num * 2))
     where padding = take num $ repeat ' '
 
-format :: Env -> Segment -> (String, Int)
-format env segment = ((bolden config $ colorForeground (foreground segment) body'),
-                      (length body'))
-    where config = getSegmentConfig segment
-          body' = body env segment
+format :: Bool -> Maybe String -> (String, Int) -> (String, Int)
+format bold foreground (string, width) =
+    ((bolden bold $ colorForeground foreground string), width)
 
 draw :: Env -> Bool -> Bool -> String -> Int -> Segment -> (String, Int)
 draw env dir skipDivider divider padding (Condition condition first second) =
@@ -248,16 +255,17 @@ draw env dir skipDivider divider padding (Condition condition first second) =
                                      then drawSegment second
                                      else ("", 0)
           width = if firstWidth > secondWidth then firstWidth else secondWidth
-draw env True skipDivider divider padding segment =
-    ("%F{" ++ bg ++ "}" ++ divider ++ "%f%K{" ++ bg ++ "}" ++ body', (width' + 2))
+draw env reverse skipDivider divider padding segment
+    | reverse = ("%F{" ++ bg ++ "}" ++ divider ++ "%f%K{" ++ bg ++ "}" ++ body'', (width'' + 2))
+    | otherwise = ("%K{" ++ bg ++ "}" ++ div ++ "%f" ++ body'' ++ "%F{" ++ bg ++ "}%k", (width'' + 2))
     where bg = background segment
-          expectedWidth = width $ getSegmentConfig segment
-          (body', width') = pad expectedWidth padding $ format env segment
-draw env False skipDivider divider padding segment =
-    ("%K{" ++ bg ++ "}" ++ div ++ "%f" ++ body' ++ "%F{" ++ bg ++ "}%k", (width' + 2))
-    where bg = background segment
-          expectedWidth = width $ getSegmentConfig segment
-          (body', width') = pad expectedWidth padding $ format env segment
+          fg = foreground segment
+          config = getSegmentConfig segment
+          b = bold config
+          expectedWidth = width config
+          body' = body env segment
+          width' = length body'
+          (body'', width'') = pad expectedWidth padding $ format b fg $ chop expectedWidth $ (body', width')
           div = if skipDivider then "" else divider
 
 --Extract config from a segment
