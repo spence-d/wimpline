@@ -28,7 +28,6 @@ data SegmentConfig = SegmentConfig { background1 :: String,
                                      foreground1 :: Maybe String,
                                      foreground2 :: Maybe String,
                                      alwaysShown :: Bool,
-                                     pivot ::Bool,
                                      width :: Maybe Int,
                                      bold :: Bool,
                                      short :: Bool } deriving (Show)
@@ -38,7 +37,6 @@ defaultSegmentConfig = SegmentConfig { background1 = "16",
                                        foreground1 = Nothing,
                                        foreground2 = Nothing,
                                        alwaysShown = False,
-                                       pivot = False,
                                        width = Nothing,
                                        bold = False,
                                        short = False }
@@ -62,7 +60,6 @@ processSegmentConfig config flag arg =
                  'f' -> config { foreground1 = Just arg }
                  'F' -> config { foreground2 = Just arg }
                  'w' -> config { width = Just (read arg :: Int) }
-                 'r' -> config { pivot = True }
 
 background :: Segment -> String
 background (StrSegment _ SegmentConfig {background1 = bg}) = bg
@@ -256,8 +253,8 @@ draw env dir skipDivider divider padding (Condition condition first second) =
                                      else ("", 0)
           width = if firstWidth > secondWidth then firstWidth else secondWidth
 draw env reverse skipDivider divider padding segment
-    | reverse = ("%F{" ++ bg ++ "}" ++ divider ++ "%f%K{" ++ bg ++ "}" ++ body'', (width'' + 2))
-    | otherwise = ("%K{" ++ bg ++ "}" ++ div ++ "%f" ++ body'' ++ "%F{" ++ bg ++ "}%k", (width'' + 2))
+    | reverse = ("%F{" ++ bg ++ "}" ++ divider ++ "%f%K{" ++ bg ++ "}" ++ body'', (width'' + (length divider)))
+    | otherwise = ("%K{" ++ bg ++ "}" ++ div ++ "%f" ++ body'' ++ "%F{" ++ bg ++ "}%k", (width'' + (length div)))
     where bg = background segment
           fg = foreground segment
           config = getSegmentConfig segment
@@ -289,46 +286,49 @@ setSegmentConfig (Duration x _) c = Duration x c
 setSegmentConfig (Empty _) c = Empty c
 
 --Process list of segments with their configurations
-processSegments :: Env -> [String] -> [Segment]
-processSegments _ [] = []
+processSegments :: Env -> [String] -> ([Segment], Maybe Segment, [Segment])
+processSegments _ [] = ([], Nothing, [])
 processSegments env (('-':flag:arg):args) =
-    case flag of 'h' -> (Hostname (if null arg
+    case flag of 'h' -> ((Hostname (if null arg
                                    then Nothing
-                                   else Just arg) defaultSegmentConfig { short = True }):segments
-                 'H' -> (Hostname (if null arg
+                                   else Just arg) defaultSegmentConfig { short = True }):left, middle, right)
+                 'H' -> ((Hostname (if null arg
                                    then Nothing
-                                   else Just arg) defaultSegmentConfig):segments
-                 'x' -> (ExitCode (read arg :: Int) defaultSegmentConfig { short = True }):segments
-                 'X' -> (ExitCode (read arg :: Int) defaultSegmentConfig):segments
-                 'v' -> (ViMode arg defaultSegmentConfig { short = True }):segments
-                 'V' -> (ViMode arg defaultSegmentConfig):segments
-                 't' -> (Duration (if null arg
+                                   else Just arg) defaultSegmentConfig):left, middle, right)
+                 'x' -> ((ExitCode (read arg :: Int) defaultSegmentConfig { short = True }):left, middle, right)
+                 'X' -> ((ExitCode (read arg :: Int) defaultSegmentConfig):left, middle, right)
+                 'v' -> ((ViMode arg defaultSegmentConfig { short = True }):left, middle, right)
+                 'V' -> ((ViMode arg defaultSegmentConfig):left, middle, right)
+                 't' -> ((Duration (if null arg
                                    then Nothing
-                                   else Just (read arg :: Double)) defaultSegmentConfig { short = True }):segments
-                 'T' -> (Duration (if null arg
+                                   else Just (read arg :: Double)) defaultSegmentConfig { short = True }):left, middle, right)
+                 'T' -> ((Duration (if null arg
                                    then Nothing
-                                   else Just (read arg :: Double)) defaultSegmentConfig):segments
-                 '0' -> (Empty defaultSegmentConfig):segments
-                 'd' -> (Path (if null arg
+                                   else Just (read arg :: Double)) defaultSegmentConfig):left, middle, right)
+                 '0' -> ((Empty defaultSegmentConfig):left, middle, right)
+                 'd' -> ((Path (if null arg
                                then Nothing
-                               else Just (read arg :: Int)) defaultSegmentConfig { short = True }):segments
-                 'D' -> (Path (if null arg
+                               else Just (read arg :: Int)) defaultSegmentConfig { short = True }):left, middle, right)
+                 'D' -> ((Path (if null arg
                                then Nothing
-                               else Just (read arg :: Int)) defaultSegmentConfig):segments
-                 'o' -> let (first:second:rest) = segments
-                        in if visible env first then first:rest else second:rest
-                 'c' -> let (first:second:rest) = segments
-                        in (Condition arg first second):rest
-                 _   -> let (segment:rest) = segments
+                               else Just (read arg :: Int)) defaultSegmentConfig):left, middle, right)
+                 'o' -> let (first:second:rest) = left
+                        in if visible env first then (first:rest, middle, right) else (second:rest, middle, right)
+                 'c' -> let (first:second:rest) = left
+                        in ((Condition arg first second):rest, middle, right)
+                 'p' -> let (segment:rest) = left
+                        in ([], Just segment, rest)
+                 _   -> let (segment:rest) = left
                             config = getSegmentConfig segment
                             updatedConfig = processSegmentConfig config flag arg
-                        in (setSegmentConfig segment updatedConfig):rest
-    where segments = processSegments env args
-processSegments env (arg:args) = (StrSegment arg defaultSegmentConfig):processSegments env args
+                        in ((setSegmentConfig segment updatedConfig):rest, middle, right)
+    where (left, middle, right) = processSegments env args
+processSegments env (arg:args) = ((StrSegment arg defaultSegmentConfig):left, middle, right)
+    where (left, middle, right) = processSegments env args
 
 --Process list of arguments until -- and pass off to processSegments
-processArgs :: Env -> [String] -> (Config, [Segment])
-processArgs _ [] = (defaultConfig, [])
+processArgs :: Env -> [String] -> (Config, ([Segment], Maybe Segment, [Segment]))
+processArgs _ [] = (defaultConfig, ([], Nothing, []))
 
 processArgs env ("--":xs) = (defaultConfig, processSegments env xs)
 
@@ -345,20 +345,25 @@ visible :: Env -> Segment -> Bool
 visible _ (Empty _) = True
 visible env segment = not $ null $ body env segment
 
-prompt :: Env -> (Config, [Segment]) -> String
+border :: Config -> String
+border Config {divider = divider, rightSide = reverse} =
+    case divider of Just d    -> --TODO make this work for headers
+                        if length d == 1 && head d >= '\57520' && head d <= '\57537'
+                        then [succ $ succ (head d)]
+                        else d
+                    otherwise -> if reverse then "\57522" else "\57520"
+
+prompt :: Env -> (Config, [Segment]) -> (String, Maybe Int)
 prompt env (config, segments) =
-    fst (foldl concatSegments ("", columns) shownSegments) ++ suffix
+    foldl concatSegments ("", columns) shownSegments
     where shownSegments = filter (visible env) segments
           Config {padding = padding, divider = divider,
                   rightSide = reverse, columns = columns} = config
-          div = case divider of Just d  -> d
-                                otherwise -> if reverse then "\57522" else "\57520"
-          suffix = if reverse then "%k" else div ++ "%f "
           concatSegments (buf, Nothing) segment = (buf ++ body,
                                                    Nothing)
               where pad = case segment of Empty _ -> 0
                                           otherwise -> padding
-                    (body, width) = draw env reverse (null buf) div pad segment
+                    (body, width) = draw env reverse (null buf) (border config) pad segment
           concatSegments (buf, Just colsLeft) segment = if adjustedCols >= 0
                                                         then (buf ++ body,
                                                               Just adjustedCols)
@@ -366,7 +371,21 @@ prompt env (config, segments) =
               where adjustedCols = colsLeft - width
                     pad = case segment of Empty _ -> 0
                                           otherwise -> padding
-                    (body, width) = draw env reverse (null buf) div pad segment
+                    (body, width) = draw env reverse (null buf) (border config) pad segment
+
+line :: Env -> (Config, ([Segment], Maybe Segment, [Segment])) -> String
+line env (config, (left, Just middle, right)) =
+    left' ++ middle'' ++ "%K{" ++ bg ++ "}" ++ right' ++ "%k"
+    where (left', leftLen) = prompt env (config, left)
+          (right', rightLen) = prompt env (config {rightSide = True, columns = leftLen}, right)
+          middleConfig = getSegmentConfig middle
+          Just remainingCols = rightLen
+          middle' = setSegmentConfig middle middleConfig {width = Just (remainingCols - 1)}
+          middle'' = fst $ draw env False False (border config) 0 middle'
+          bg = background middle
+line env (config, (left, _, _)) = (fst $ prompt env (config, left)) ++ suffix
+    where reverse = rightSide config
+          suffix = if reverse then "%k" else (border config) ++ "%f "
 
 main :: IO ()
 main = do
@@ -377,4 +396,4 @@ main = do
     let env = Env {cwd = cwd,
                    home = home,
                    ssh = (sshClient /= Nothing)}
-        in putStr $ prompt env $ processArgs env args
+        in putStr $ line env $ processArgs env args
